@@ -18,6 +18,9 @@ use mount::Mount;
 use persistent::{Read, Write};
 use staticfile::Static;
 
+use chrono::prelude::*;
+use rusqlite::{types::ToSql, Connection};
+
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
 use shared_child::SharedChild;
@@ -29,6 +32,9 @@ const BUILD_ROUTE: &str = "./tmp";
 const LAYOUT_DIR: &str = "./layouts";
 const BUILD_DIR: &str = "./tmp_builds";
 const CONFIG_DIR: &str = "./tmp_config";
+
+const DB_FILE: &str = "./stats.db";
+const DB_SCHEMA: &str = include_str!("../db-schema.sqlite");
 
 #[derive(Clone, Deserialize)]
 pub struct BuildRequest {
@@ -48,8 +54,81 @@ impl Key for JobQueue {
     type Value = HashMap<String, Option<Arc<SharedChild>>>;
 }
 
+#[derive(Copy, Clone)]
+pub struct Database;
+impl Key for Database {
+    type Value = rusqlite::Connection;
+}
+
+#[derive(Debug)]
+struct RequestLog {
+    id: i32,
+    uid: Option<i32>,
+    ip_addr: String,
+    os: String,
+    web: bool,
+    serial: Option<i32>,
+    hash: String,
+    board: String,
+    variant: String,
+    layers: i32,
+    container: String,
+    success: bool,
+    request_time: DateTime<Utc>,
+    build_duration: Option<i32>,
+}
+impl RequestLog {
+    fn from_row(row: &rusqlite::Row) -> Self {
+        RequestLog {
+            id: row.get(0),
+            uid: row.get(1),
+            ip_addr: row.get(2),
+            os: row.get(3),
+            web: row.get(4),
+            serial: row.get(5),
+            hash: row.get(6),
+            board: row.get(7),
+            variant: row.get(8),
+            layers: row.get(9),
+            container: row.get(10),
+            success: row.get(11),
+            request_time: row.get(12),
+            build_duration: row.get(13),
+        }
+    }
+}
+
 fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
+    //println!("Headers: {:?}", req.headers);
     if let Ok(Some(body)) = req.get::<bodyparser::Struct<BuildRequest>>() {
+        let ip = req.remote_addr.ip();
+        let user_agent = req
+            .headers
+            .get::<headers::UserAgent>()
+            .unwrap_or(&iron::headers::UserAgent("".to_owned()))
+            .to_string();
+
+        let os = {
+            let ua = user_agent.to_lowercase();
+            if ua.contains("windows") {
+                "Windows"
+            } else if ua.contains("mac") {
+                "Mac"
+            } else if ua.contains("linux") || ua.contains("x11") {
+                "Linux"
+            } else {
+                "Unknown"
+            }
+        }
+        .to_string();
+
+        let is_desktop_configurator = user_agent.to_lowercase().contains("electron");
+        println!("IP: {:?}", ip);
+        println!("OS: {:?}", os);
+        println!("WEB: {:?}", !is_desktop_configurator);
+
+        let request_time: DateTime<Utc> = Utc::now();
+
         let config = body.config;
         let container = match body.env.as_ref() {
             "lts" => "controller-050",
@@ -57,10 +136,12 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         }
         .to_string();
 
+        let config_str = serde_json::to_string(&config).unwrap();
+
         let hash = {
             let mut hasher = DefaultHasher::new();
             container.hash(&mut hasher);
-            //body.hash(&mut hasher);
+            config_str.hash(&mut hasher);
             let h = hasher.finish();
             format!("{:x}", h)
         };
@@ -92,9 +173,9 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                 println!("{:?}", info);
 
                 let config_file = format!("{}/{}-{}.json", config_dir, info.name, info.variant);
-                fs::write(&config_file, serde_json::to_string(&config).unwrap()).unwrap();
+                fs::write(&config_file, &config_str).unwrap();
 
-                let process = start_build(container, info, hash.clone(), output_file);
+                let process = start_build(container.clone(), info, hash.clone(), output_file);
                 let arc = Arc::new(process);
                 (*queue).insert(hash.clone(), Some(arc.clone()));
                 Some(arc)
@@ -106,7 +187,7 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         let info = configure_build(&config, vec!["".to_string()]);
         let output_file = format!("{}-{}-{}.zip", info.name, info.variant, hash);
 
-        let success = match job {
+        let (success, duration) = match job {
             Some(arc) => {
                 let process = arc.clone();
                 println!(" > Waiting for task to finish {}", process.id());
@@ -121,13 +202,47 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                     // drop lock
                 }
 
-                exit_status.success()
+                let duration = Some(Utc::now().signed_duration_since(request_time));
+                let success = exit_status.success();
+                (success, duration)
             }
             None => {
                 println!(" > Job already in finished {}. Updating time.", hash);
-                true
+                (true, None)
             }
         };
+
+        let build_duration = match duration {
+            Some(t) => Some(t.num_milliseconds()),
+            None => None,
+        };
+        println!(
+            "Started at: {:?}, Duration: {:?}",
+            request_time, build_duration
+        );
+
+        let layers = vec![""];
+        let args: &[&ToSql] = &[
+            &(ip.to_string()),
+            &os,
+            &!is_desktop_configurator,
+            &hash,
+            &info.name,
+            &info.variant,
+            &(layers.len() as u32),
+            &container,
+            &success,
+            &request_time,
+            &build_duration,
+        ];
+
+        {
+            let mutex = req.get::<Write<Database>>().unwrap();
+            let db = mutex.lock().unwrap();
+            // TODO: uid, serial
+            (*db).execute("INSERT INTO Requests (ip_addr, os, web, hash, board, variant, layers, container, success, request_time, build_duration)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", args).unwrap();
+        }
 
         if success {
             let result = BuildResult {
@@ -171,6 +286,97 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
     )));
 }
 
+fn stats(req: &mut Request<'_, '_>) -> IronResult<Response> {
+    let mutex = req.get::<Write<Database>>().unwrap();
+    let db = mutex.lock().unwrap();
+    let args: &[&ToSql] = &[];
+
+    let mut result = String::new();
+    let mut total_layers: usize = 0;
+    let mut total_buildtime = 0;
+    let mut os_counts: HashMap<String, usize> = HashMap::new();
+    let mut platform_counts: HashMap<String, usize> = HashMap::new();
+    let mut keyboard_counts: HashMap<String, usize> = HashMap::new();
+    let mut container_counts: HashMap<String, usize> = HashMap::new();
+    let mut hashes: Vec<String> = Vec::new();
+    let mut users: Vec<String> = Vec::new();
+
+    let mut stmt = (*db).prepare("SELECT * FROM Requests").unwrap();
+    let rows = stmt
+        .query_map(args, |row| RequestLog::from_row(row))
+        .unwrap();
+    for row in rows {
+        let request = row.unwrap();
+        println!("req: {:?}", request);
+
+        let counter = os_counts.entry(request.os).or_insert(0);
+        *counter += 1;
+
+        let platform = match request.web {
+            true => "Web",
+            false => "Desktop",
+        }
+        .to_string();
+        let counter = platform_counts.entry(platform).or_insert(0);
+        *counter += 1;
+
+        let keyboard = format!("{}-{}", request.board, request.variant);
+        let counter = keyboard_counts.entry(keyboard).or_insert(0);
+        *counter += 1;
+
+        let counter = container_counts.entry(request.container).or_insert(0);
+        *counter += 1;
+
+        total_layers += request.layers as usize;
+        total_buildtime += request.build_duration.unwrap_or(0) as i32;
+
+        hashes.push(request.hash);
+        users.push(request.ip_addr); //requst.uid
+    }
+
+    let total_builds = hashes.len();
+    hashes.sort();
+    hashes.dedup();
+    let unique_builds = hashes.len();
+
+    users.sort();
+    users.dedup();
+    let unique_users = users.len();
+
+    let cache_ratio = match unique_builds {
+        0 => 0.,
+        _ => (total_builds as f32) / (unique_builds as f32),
+    };
+
+    let user_ratio = match unique_builds {
+        0 => 0.,
+        _ => (total_builds as f32) / (unique_users as f32),
+    };
+
+    let layers_ratio = match unique_builds {
+        0 => 0.,
+        _ => (total_layers as f32) / (total_builds as f32),
+    };
+
+    let build_time = match unique_builds {
+        0 => 0,
+        _ => total_buildtime / (unique_builds as i32),
+    };
+
+    result += &format!("Builds: {} ({} unique)\n", total_builds, unique_builds);
+    result += &format!("Cache ratio: {:.1}\n", cache_ratio);
+    result += &format!("Avg time: {:.3} s\n\n", (build_time as f32) / 1000.0);
+    result += &format!("Users: {} unique\n", unique_users);
+    result += &format!("Avg builds per user: {:.1}\n", user_ratio);
+    result += &format!("Average number of layers: {}\n\n", layers_ratio);
+    result += &format!("OS Counts: {:#?}\n", os_counts);
+    result += &format!("Platform Counts: {:#?}\n", platform_counts);
+    result += &format!("Keyboard Counts: {:#?}\n", keyboard_counts);
+    result += &format!("Version Counts: {:#?}\n\n", container_counts);
+
+    return Ok(Response::with((status::Ok, result)));
+}
+
 fn main() {
     pretty_env_logger::init();
 
@@ -184,9 +390,12 @@ fn main() {
     }*/
 
     let queue: HashMap<String, Option<Arc<SharedChild>>> = HashMap::new();
+    let args: &[&ToSql] = &[];
+    let db = Connection::open(Path::new(DB_FILE)).unwrap();
+    db.execute(DB_SCHEMA, args).unwrap();
 
     /*println!("\nExisting builds: ");
-    let builds = get_builds("controller-050");
+    let builds = get_builds("controller-051");
     for build in builds.lines().skip(1) {
         println!(" - {}", build);
         queue.insert(build.to_string(), None);
@@ -204,11 +413,13 @@ fn main() {
     let mut mount = Mount::new();
     mount.mount("/layouts/", Static::new(Path::new(LAYOUT_DIR)));
     mount.mount("/tmp/", Static::new(Path::new(BUILD_DIR)));
+    mount.mount("/stats", stats);
     mount.mount("/", build_request);
 
     println!("\nBuild dispatcher starting.\nListening on {}", API_HOST);
     let mut chain = Chain::new(mount);
     chain.link_before(Write::<JobQueue>::one(queue));
+    chain.link_before(Write::<Database>::one(db));
     chain.link_before(Read::<bodyparser::MaxBodyLength>::one(MAX_BODY_LENGTH));
     chain.link_before(logger_before);
     chain.link_after(logger_after);

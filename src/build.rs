@@ -81,7 +81,7 @@ pub fn start_build(
     output_file: String,
 ) -> SharedChild {
     /*let mut sleep = Command::new("sleep");
-    sleep.args(&["10"]);
+    sleep.args(&["1"]);
     let process = SharedChild::spawn(&mut sleep).expect("Failed to execute!");*/
 
     let mut args = vec![
