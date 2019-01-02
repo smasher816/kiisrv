@@ -25,7 +25,7 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json;
 use shared_child::SharedChild;
 
-const API_HOST: &str = "0.0.0.0:3000";
+const API_HOST: &str = "0.0.0.0:3001";
 const MAX_BODY_LENGTH: usize = 1024 * 1024 * 10;
 const BUILD_ROUTE: &str = "./tmp";
 
@@ -132,7 +132,7 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         let config = body.config;
         let container = match body.env.as_ref() {
             "lts" => "controller-050",
-            "latest" | _ => "controller-051",
+            "latest" | _ => "controller-053",
         }
         .to_string();
 
@@ -169,10 +169,10 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                 }
 
                 let info = configure_build(&config, layers);
-                let output_file = format!("{}-{}-{}.zip", info.name, info.variant, hash);
+                let output_file = format!("{}-{}-{}.zip", info.name, info.layout, hash);
                 println!("{:?}", info);
 
-                let config_file = format!("{}/{}-{}.json", config_dir, info.name, info.variant);
+                let config_file = format!("{}/{}-{}.json", config_dir, info.name, info.layout);
                 fs::write(&config_file, &config_str).unwrap();
 
                 let process = start_build(container.clone(), info, hash.clone(), output_file);
@@ -185,7 +185,7 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         };
 
         let info = configure_build(&config, vec!["".to_string()]);
-        let output_file = format!("{}-{}-{}.zip", info.name, info.variant, hash);
+        let output_file = format!("{}-{}-{}.zip", info.name, info.layout, hash);
 
         let (success, duration) = match job {
             Some(arc) => {
@@ -228,7 +228,7 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
             &!is_desktop_configurator,
             &hash,
             &info.name,
-            &info.variant,
+            &info.layout,
             &(layers.len() as u32),
             &container,
             &success,
