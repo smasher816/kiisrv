@@ -52,10 +52,16 @@ pub struct BuildResult {
     pub success: bool,
 }
 
+#[derive(Clone)]
+pub enum JobEntry {
+    Building(Arc<SharedChild>),
+    Finished(bool),
+}
+
 #[derive(Copy, Clone)]
 pub struct JobQueue;
 impl Key for JobQueue {
-    type Value = HashMap<String, Option<Arc<SharedChild>>>;
+    type Value = HashMap<String, JobEntry>;
 }
 
 #[derive(Copy, Clone)]
@@ -182,7 +188,7 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         };
         println!("Received request: {}", hash);
 
-        let job: Option<Arc<SharedChild>> = {
+        let job: JobEntry = {
             let mutex = req.get::<Write<JobQueue>>().unwrap();
             let mut queue = mutex.lock().unwrap();
 
@@ -211,39 +217,39 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                 fs::write(&config_file, &config_str).unwrap();
 
                 let process = start_build(container.clone(), info, hash.clone(), output_file);
-                let arc = Arc::new(process);
-                (*queue).insert(hash.clone(), Some(arc.clone()));
-                Some(arc)
+                let job = JobEntry::Building(Arc::new(process));
+                (*queue).insert(hash.clone(), job.clone());
+                job
             }
 
             // drop lock
         };
 
         let info = configure_build(&config, vec!["".to_string()]);
-        let output_file = format!("{}-{}-{}.zip", info.name, info.layout, hash);
+        let mut output_file = format!("{}-{}-{}.zip", info.name, info.layout, hash);
 
         let (success, duration) = match job {
-            Some(arc) => {
+            JobEntry::Building(arc) => {
                 let process = arc.clone();
                 println!(" > Waiting for task to finish {}", process.id());
                 let exit_status = process.wait().unwrap();
+                let success: bool = exit_status.success();
                 println!(" > Done");
 
                 {
                     let rwlock = req.get::<Write<JobQueue>>().unwrap();
                     let mut queue = rwlock.lock().unwrap();
                     let job = (*queue).get_mut(&hash).unwrap();
-                    *job = None;
+                    *job = JobEntry::Finished(success);
                     // drop lock
                 }
 
                 let duration = Some(Utc::now().signed_duration_since(request_time));
-                let success = exit_status.success();
                 (success, duration)
             }
-            None => {
+            JobEntry::Finished(success) => {
                 println!(" > Job already in finished {}. Updating time.", hash);
-                (true, None)
+                (success, None)
             }
         };
 
@@ -279,24 +285,20 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", args).unwrap();
         }
 
-        if success {
-            let result = BuildResult {
-                filename: format!("{}/{}", BUILD_ROUTE, output_file),
-                success: true,
-            };
-
-            return Ok(Response::with((
-                status::Ok,
-                Header(headers::ContentType::json()),
-                serde_json::to_string(&result).unwrap(),
-            )));
-        } else {
-            return Ok(Response::with((
-                status::InternalServerError,
-                Header(headers::ContentType::json()),
-                "{ error: \"build failed\" }",
-            )));
+        if !success {
+            output_file = format!("{}-{}-{}_error.zip", info.name, info.layout, hash);
         }
+
+        let result = BuildResult {
+            filename: format!("{}/{}", BUILD_ROUTE, output_file),
+            success: success,
+        };
+
+        return Ok(Response::with((
+            status::Ok,
+            Header(headers::ContentType::json()),
+            serde_json::to_string(&result).unwrap(),
+        )));
     } else if let Err(err) = req.get::<bodyparser::Struct<BuildRequest>>() {
         println!("Parse error: {:?}", err);
         use bodyparser::BodyErrorCause::JsonError;
@@ -424,7 +426,7 @@ fn main() {
         std::process::exit(status.code().unwrap_or(1));
     }*/
 
-    let queue: HashMap<String, Option<Arc<SharedChild>>> = HashMap::new();
+    let queue: HashMap<String, JobEntry> = HashMap::new();
     let args: &[&ToSql] = &[];
     let db = Connection::open(Path::new(DB_FILE)).unwrap();
     db.execute(DB_SCHEMA, args).unwrap();
