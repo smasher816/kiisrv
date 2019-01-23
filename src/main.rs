@@ -70,6 +70,12 @@ impl Key for Database {
     type Value = rusqlite::Connection;
 }
 
+#[derive(Copy, Clone)]
+pub struct VersionsMap;
+impl Key for VersionsMap {
+    type Value = HashMap<String, String>;
+}
+
 #[derive(Debug)]
 struct RequestLog {
     id: i32,
@@ -417,6 +423,33 @@ fn stats(req: &mut Request<'_, '_>) -> IronResult<Response> {
     return Ok(Response::with((status::Ok, result)));
 }
 
+fn versions_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
+    let versions = req.get::<Read<VersionsMap>>().unwrap();
+
+    Ok(Response::with((
+        status::Ok,
+        Header(headers::ContentType::json()),
+        serde_json::to_string(&*versions).unwrap(),
+    )))
+}
+
+fn version_map() -> HashMap<String, String> {
+    let mut versions: HashMap<String, String> = HashMap::new();
+    versions.insert("latest".to_string(), "controller-053".to_string());
+    versions.insert("lts".to_string(), "controller-050".to_string());
+    versions.insert("v.0.5.3".to_string(), "controller-053".to_string());
+    versions.insert("v.0.5.2".to_string(), "controller-052".to_string());
+    versions.insert("v.0.5.1".to_string(), "controller-051".to_string());
+    versions.insert("v.0.5.0".to_string(), "controller-050".to_string());
+    versions.insert("0.4.9".to_string(), "controller-049".to_string());
+
+    let containers = list_containers();
+    versions
+        .into_iter()
+        .filter(|(_, v)| containers.contains(&v))
+        .collect()
+}
+
 fn main() {
     pretty_env_logger::init();
 
@@ -445,8 +478,9 @@ fn main() {
     old_builds("controller-050");
     println!("");*/
 
-    println!("\nAvailable build containers:");
-    println!("{:?}", list_containers());
+    let versions = version_map();
+    println!("\nVersions:");
+    println!("{:#?}", versions);
 
     let (logger_before, logger_after) = Logger::new(None);
 
@@ -457,6 +491,7 @@ fn main() {
     //mount.mount("/layouts/", Static::new(Path::new(LAYOUT_DIR)));
     mount.mount("/layouts/", layout_router);
     mount.mount("/tmp/", Static::new(Path::new(BUILD_DIR)));
+    mount.mount("/versions", versions_request);
     mount.mount("/stats", stats);
     mount.mount("/", build_request);
 
@@ -464,6 +499,7 @@ fn main() {
     let mut chain = Chain::new(mount);
     chain.link_before(Write::<JobQueue>::one(queue));
     chain.link_before(Write::<Database>::one(db));
+    chain.link_before(Read::<VersionsMap>::one(versions));
     chain.link_before(Read::<bodyparser::MaxBodyLength>::one(MAX_BODY_LENGTH));
     chain.link_before(logger_before);
     chain.link_after(logger_after);
