@@ -189,8 +189,8 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         println!("Received request: {}", hash);
 
         let job: JobEntry = {
-            let mutex = req.get::<Write<JobQueue>>().unwrap();
-            let mut queue = mutex.lock().unwrap();
+            let mutex = req.get::<Write<JobQueue>>().expect("Could not find mutex");
+            let mut queue = mutex.lock().expect("Could not lock mutex"); // *** Panics if poisoned **
 
             if let Some(job) = (*queue).get(&hash) {
                 println!(" > Existing task");
@@ -199,13 +199,13 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                 println!(" > Starting new build");
 
                 let config_dir = format!("{}/{}", CONFIG_DIR, hash);
-                fs::create_dir_all(&config_dir).unwrap();
+                fs::create_dir_all(&config_dir).expect("Could not create directory");
 
                 let mut layers: Vec<String> = Vec::new();
                 let files = generate_kll(&config, body.env == "lts");
                 for file in files {
                     let filename = format!("{}/{}", config_dir, file.name);
-                    fs::write(&filename, file.content).unwrap();
+                    fs::write(&filename, file.content).expect("Could not write kll file");
                     layers.push(format!("{}", filename));
                 }
 
@@ -214,7 +214,7 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                 println!("{:?}", info);
 
                 let config_file = format!("{}/{}-{}.json", config_dir, info.name, info.layout);
-                fs::write(&config_file, &config_str).unwrap();
+                fs::write(&config_file, &config_str).expect("Could not write config file");
 
                 let process = start_build(container.clone(), info, hash.clone(), output_file);
                 let job = JobEntry::Building(Arc::new(process));
@@ -237,9 +237,9 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
                 println!(" > Done");
 
                 {
-                    let rwlock = req.get::<Write<JobQueue>>().unwrap();
-                    let mut queue = rwlock.lock().unwrap();
-                    let job = (*queue).get_mut(&hash).unwrap();
+                    let rwlock = req.get::<Write<JobQueue>>().expect("Could not find mutex");
+                    let mut queue = rwlock.lock().expect("Could not lock mutex");
+                    let job = (*queue).get_mut(&hash).expect("Could not find job");
                     *job = JobEntry::Finished(success);
                     // drop lock
                 }
@@ -278,11 +278,14 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         ];
 
         {
-            let mutex = req.get::<Write<Database>>().unwrap();
-            let db = mutex.lock().unwrap();
+            let mutex = req.get::<Write<Database>>().expect("Could not find mutex");
+            let db = mutex.lock().expect("Could not lock mutex");
             // TODO: uid, serial
             (*db).execute("INSERT INTO Requests (ip_addr, os, web, hash, board, variant, layers, container, success, request_time, build_duration)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", args).unwrap();
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", args).unwrap_or_else(|_| {
+			println!("Error: Failed to insert request into stats db");
+			0 as usize
+		});
         }
 
         if !success {
