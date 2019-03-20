@@ -4,6 +4,7 @@ mod kll;
 use crate::build::*;
 use crate::kll::*;
 
+use indexmap::IndexMap;
 use std::collections::hash_map::{DefaultHasher, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -37,8 +38,14 @@ const LAYOUT_DIR: &str = "./layouts";
 const BUILD_DIR: &str = "./tmp_builds";
 const CONFIG_DIR: &str = "./tmp_config";
 
-const DB_FILE: &str = "./stats.db";
-const DB_SCHEMA: &str = include_str!("../db-schema.sqlite");
+const STATS_DB_FILE: &str = "./stats.db";
+const STATS_DB_SCHEMA: &str = include_str!("../schema/stats.sqlite");
+
+const CONFIG_DB_FILE: &str = "./config.db";
+const CONFIG_DB_SCHEMA: &str = include_str!("../schema/config.sqlite");
+
+const CONTROLLER_GIT_URL: &str = "https://github.com/kiibohd/controller.git";
+const CONTROLLER_GIT_REMOTE: &str = "controller";
 
 #[derive(Clone, Deserialize)]
 pub struct BuildRequest {
@@ -65,15 +72,15 @@ impl Key for JobQueue {
 }
 
 #[derive(Copy, Clone)]
-pub struct Database;
-impl Key for Database {
+pub struct StatsDatabase;
+impl Key for StatsDatabase {
     type Value = rusqlite::Connection;
 }
 
 #[derive(Copy, Clone)]
-pub struct VersionsMap;
-impl Key for VersionsMap {
-    type Value = HashMap<String, String>;
+pub struct Versions;
+impl Key for Versions {
+    type Value = HashMap<String, VersionInfo>;
 }
 
 #[derive(Debug)]
@@ -110,6 +117,24 @@ impl RequestLog {
             success: row.get(11),
             request_time: row.get(12),
             build_duration: row.get(13),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct VersionMap {
+    name: String,
+    channel: String,
+    container: String,
+    git_tag: String,
+}
+impl VersionMap {
+    fn from_row(row: &rusqlite::Row) -> Self {
+        VersionMap {
+            name: row.get(0),
+            channel: row.get(1),
+            container: row.get(2),
+            git_tag: row.get(3),
         }
     }
 }
@@ -284,7 +309,9 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
         ];
 
         {
-            let mutex = req.get::<Write<Database>>().expect("Could not find mutex");
+            let mutex = req
+                .get::<Write<StatsDatabase>>()
+                .expect("Could not find mutex");
             let db = mutex.lock().expect("Could not lock mutex");
             // TODO: uid, serial
             (*db).execute("INSERT INTO Requests (ip_addr, os, web, hash, board, variant, layers, container, success, request_time, build_duration)
@@ -333,7 +360,7 @@ fn build_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
 }
 
 fn stats(req: &mut Request<'_, '_>) -> IronResult<Response> {
-    let mutex = req.get::<Write<Database>>().unwrap();
+    let mutex = req.get::<Write<StatsDatabase>>().unwrap();
     let db = mutex.lock().unwrap();
     let args: &[&ToSql] = &[];
 
@@ -424,34 +451,134 @@ fn stats(req: &mut Request<'_, '_>) -> IronResult<Response> {
 }
 
 fn versions_request(req: &mut Request<'_, '_>) -> IronResult<Response> {
-    let versions = req.get::<Read<VersionsMap>>().unwrap();
+    let versions = req.get::<Read<Versions>>().unwrap();
+    let versions: HashMap<String, Option<ReleaseInfo>> = (*versions)
+        .iter()
+        .map(|(k, v)| (k.clone(), v.info.clone()))
+        .collect();
 
     Ok(Response::with((
         status::Ok,
         Header(headers::ContentType::json()),
-        serde_json::to_string(&*versions).unwrap(),
+        serde_json::to_string(&versions).unwrap(),
     )))
 }
 
-fn version_map() -> HashMap<String, String> {
-    let mut versions: HashMap<String, String> = HashMap::new();
-    versions.insert("latest".to_string(), "controller-053".to_string());
-    versions.insert("lts".to_string(), "controller-050".to_string());
-    versions.insert("v.0.5.3".to_string(), "controller-053".to_string());
-    versions.insert("v.0.5.2".to_string(), "controller-052".to_string());
-    versions.insert("v.0.5.1".to_string(), "controller-051".to_string());
-    versions.insert("v.0.5.0".to_string(), "controller-050".to_string());
-    versions.insert("0.4.9".to_string(), "controller-049".to_string());
+fn version_map(db: rusqlite::Connection) -> HashMap<String, VersionInfo> {
+    let args: &[&ToSql] = &[];
+    let mut stmt = db.prepare("SELECT * FROM Versions").unwrap();
+    let rows = stmt
+        .query_map(args, |row| VersionMap::from_row(row))
+        .unwrap();
+    let mut versions: Vec<VersionMap> = rows.map(|r| r.unwrap()).collect();
 
     let containers = list_containers();
+    let tags = fetch_tags();
     versions
         .into_iter()
-        .filter(|(_, v)| containers.contains(&v))
+        .filter(|v| containers.contains(&v.container))
+        .map(|v| {
+            (
+                v.name,
+                VersionInfo {
+                    container: v.container,
+                    channel: v.channel,
+                    info: tags.get(&v.git_tag).map(|v| v.clone()),
+                },
+            )
+        })
         .collect()
+}
+
+fn fetch_tags() -> IndexMap<String, ReleaseInfo> {
+    let result = Command::new("git")
+        .args(&["ls-remote", "--tags", CONTROLLER_GIT_REMOTE])
+        .output()
+        .expect("Failed!");
+    let out = String::from_utf8_lossy(&result.stdout);
+    let mut map = out
+        .lines()
+        .filter(|l| !l.contains("^{}"))
+        .map(|l| l.split("\t"))
+        .map(|mut x| (x.next().unwrap().trim(), x.next().unwrap().trim()));
+
+    let mut versions = IndexMap::new();
+
+    for (h, t) in map.rev() {
+        let hash = h.to_string();
+        let tag = t.replace("refs/tags/", "");
+
+        let result = Command::new("git")
+            .args(&["rev-list", "--count", h])
+            .output()
+            .expect("Failed!");
+        let commit: u16 = String::from_utf8_lossy(&result.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        let msb = ((commit & 0xFF00) >> 8) as u8;
+        let lsb = ((commit & 0x00FF) >> 0) as u8;
+
+        fn bcd_format(x: u8) -> String {
+            if x > 99 {
+                format!("{:x?}", x)
+            } else {
+                x.to_string()
+            }
+        }
+        let bcd = format!("{}.{}", bcd_format(msb), bcd_format(lsb));
+
+        let result = Command::new("git")
+            .args(&["log", "-1", "--pretty=tformat:%ai", h])
+            .output()
+            .expect("Failed!");
+        let out = String::from_utf8_lossy(&result.stdout);
+        let date = out.trim().to_string();
+
+        let notes = format!("https://github.com/kiibohd/controller/releases/tag/{}", tag);
+        versions.insert(
+            tag,
+            ReleaseInfo {
+                commit,
+                date,
+                hash,
+                notes,
+                bcd,
+            },
+        );
+    }
+
+    versions
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionInfo {
+    container: String,
+    channel: String,
+    info: Option<ReleaseInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseInfo {
+    commit: u16,
+    date: String,
+    hash: String,
+    bcd: String,
+    notes: String,
 }
 
 fn main() {
     pretty_env_logger::init();
+
+    let result = Command::new("git")
+        .args(&["remote", "add", CONTROLLER_GIT_REMOTE, CONTROLLER_GIT_URL])
+        .status()
+        .expect("Failed");
+
+    let result = Command::new("git")
+        .args(&["fetch", CONTROLLER_GIT_REMOTE])
+        .status()
+        .expect("Failed");
 
     /*let status = Command::new("docker-compose")
         .args(&["-f", "docker-compose.yml", "up", "-d", "--no-recreate"])
@@ -463,9 +590,13 @@ fn main() {
     }*/
 
     let queue: HashMap<String, JobEntry> = HashMap::new();
+
     let args: &[&ToSql] = &[];
-    let db = Connection::open(Path::new(DB_FILE)).unwrap();
-    db.execute(DB_SCHEMA, args).unwrap();
+    let config_db = Connection::open(Path::new(CONFIG_DB_FILE)).unwrap();
+    config_db.execute(CONFIG_DB_SCHEMA, args).unwrap();
+
+    let stats_db = Connection::open(Path::new(STATS_DB_FILE)).unwrap();
+    stats_db.execute(STATS_DB_SCHEMA, args).unwrap();
 
     /*println!("\nExisting builds: ");
     let builds = get_builds("controller-051");
@@ -478,9 +609,11 @@ fn main() {
     old_builds("controller-050");
     println!("");*/
 
-    let versions = version_map();
+    let versions = version_map(config_db);
     println!("\nVersions:");
-    println!("{:#?}", versions);
+    for (v, i) in versions.iter() {
+        println!("{} -> {} [{}]", v, i.container, i.channel);
+    }
 
     let (logger_before, logger_after) = Logger::new(None);
 
@@ -498,8 +631,8 @@ fn main() {
     println!("\nBuild dispatcher starting.\nListening on {}", API_HOST);
     let mut chain = Chain::new(mount);
     chain.link_before(Write::<JobQueue>::one(queue));
-    chain.link_before(Write::<Database>::one(db));
-    chain.link_before(Read::<VersionsMap>::one(versions));
+    chain.link_before(Write::<StatsDatabase>::one(stats_db));
+    chain.link_before(Read::<Versions>::one(versions));
     chain.link_before(Read::<bodyparser::MaxBodyLength>::one(MAX_BODY_LENGTH));
     chain.link_before(logger_before);
     chain.link_after(logger_after);
